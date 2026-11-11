@@ -1,0 +1,9 @@
+# Generated files: recreate with `make data` / `make sim`
+build/
+data/
+*.vcd
+__pycache__/
+*.pyc
+
+# The spec PDF is Nasdaq's document: download it yourself (see docs/SPEC_NOTES.md)
+spec_download/
