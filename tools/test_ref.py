@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_ref.py - Unit tests for the golden model (itch_ref.py).
+test_ref.py - Unit tests for the golden model (itch_ref.py) and compare.py.
 
 The golden model is what the Verilog gets checked against, so it needs its
 own checks.  These tests use HAND-WRITTEN bytes (not the generator) so a
@@ -8,11 +8,15 @@ bug shared by the generator and the parser cannot hide.
 
 Run:  python tools/test_ref.py      (also run by `make test`)
 """
+import contextlib
+import io
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
+import compare   # noqa: E402
 import itch_ref  # noqa: E402
 
 # An Add Order built byte by byte from the table in SPEC_NOTES.md (section 1.3.1).
@@ -66,6 +70,36 @@ class TestReferenceParser(unittest.TestCase):
 
     def test_alpha_mapping(self):
         self.assertEqual(itch_ref.alpha(b"A B\x00\x7f~", 0, 6), "A_B..~")
+
+
+class TestCompare(unittest.TestCase):
+    """A checker that never fails proves nothing, so check that compare.py CAN fail."""
+
+    def run_compare(self, exp_text, act_text):
+        with tempfile.TemporaryDirectory() as d:
+            e, a = os.path.join(d, "e.txt"), os.path.join(d, "a.txt")
+            with open(e, "w") as f:
+                f.write(exp_text)
+            with open(a, "w") as f:
+                f.write(act_text)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = compare.main(["compare.py", e, a])
+            return rc, out.getvalue()
+
+    def test_identical_passes(self):
+        rc, _ = self.run_compare("1 t=44 len=19 D ref=5\n", "1 t=44 len=19 D ref=5\n")
+        self.assertEqual(rc, 0)
+
+    def test_field_mismatch_fails_and_names_field(self):
+        rc, out = self.run_compare("1 t=44 len=19 D ref=5\n", "1 t=44 len=19 D ref=6\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("ref=5", out)
+        self.assertIn("ref=6", out)
+
+    def test_missing_line_fails(self):
+        rc, _ = self.run_compare("1 t=5a len=1 SKIP\n2 t=5a len=1 SKIP\n", "1 t=5a len=1 SKIP\n")
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

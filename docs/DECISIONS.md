@@ -50,6 +50,50 @@ Spec ambiguities are covered in [SPEC_NOTES.md](SPEC_NOTES.md#ambiguities-and-th
   `compare.py` relies on this to name the field that differs.
 - **The type is printed in hex (`t=41`)** because unknown types can be non-printable bytes.
 
+## Verilog design
+
+- **Framer = 3-state FSM** (`LEN_HI → LEN_LO → BODY`) with a down-counter. It knows nothing about
+  ITCH message types. It only splits the stream using the length prefix. That makes "skip unknown
+  types" automatic: the framer passes every message through, and the decoder chooses not to decode it.
+- **The decoder buffers the whole message (40 bytes), then extracts fields.** Grabbing each field as
+  its bytes stream past would save flip-flops, but it spreads the offsets across many comparisons.
+  With the buffer, every offset sits in one `case` statement that reads like the spec table.
+  The cost is 320 flip-flops, which is tiny.
+- **The buffer is 40 bytes, not 39.** The first version used 39 (the length of `R`). But `F` is 40
+  bytes, and the comparison step caught the missing last MPID byte. This is the kind of bug the
+  golden-model approach exists to catch.
+- **Shared output ports.** Fields that mean the same thing in several types share one port. For
+  example, `out_order_ref` is used by A/F/E/C/X/D and as the *original* ref in U. `out_shares` is
+  shares, executed shares, or cancelled shares, depending on type. Fields a type doesn't have are
+  driven to 0. This avoids about 40 nearly identical ports.
+- **`be(offset, nbytes)` helper function.** It concatenates buffer bytes big-endian. It is only
+  ever called with constants, so synthesis reduces it to wiring.
+- **Only control signals are reset.** `out_valid` and the FSM state are reset. Data registers are
+  simply overwritten for each message. This is standard practice and reduces reset fan-out.
+- **No backpressure in v1.** The decoder can always keep up (one byte per clock in, at most one
+  message per 3 clocks out), so `in_ready` is tied to 1. It is still a real port, so a later
+  version can add backpressure without changing the interface.
+- **Latency is 2 clocks** from the clock edge that accepts a message's last byte to `out_valid`:
+  one register stage in the framer and one in the decoder.
+- **Synthesizability is checked by a script.** `tools/check_rtl.py` (run by `make test`) fails if
+  any file in `rtl/` contains a `$system_task`, an `initial` block, or a `#delay`.
+
+## Verification
+
+- **Three full-parser runs** in `make test`: back-to-back (`in_valid` always high), 30% random stalls
+  (seed 1), and 75% random stalls (seed 99). All three must match `expected.txt` exactly.
+  Stalls are random per cycle, so they land between length bytes, inside the body, and on
+  message boundaries.
+- **The framer is also tested alone** (phase 2 testbench). Its testbench checks that each message
+  has exactly `msg_len` beats from `msg_first` to `msg_last`.
+- **Protocol checks in the testbench:** `out_valid` is never high for 2 cycles in a row, and
+  `in_ready` never drops.
+- **The checkers are checked.** `test_ref.py` confirms that `compare.py` fails on a changed field
+  and on a missing line. During development, changing one decoder offset (X shares 19 → 20) was
+  confirmed to make `make test` fail with a clear message.
+- **iverilog uses `-g2012`** so the testbenches can use `$fatal`, which gives `vvp` a nonzero exit
+  code on failure. The RTL uses only Verilog-2001 constructs.
+
 ## Golden model (tools/itch_ref.py)
 
 - **The reference parser is checked independently.** `tools/test_ref.py` builds an Add Order by

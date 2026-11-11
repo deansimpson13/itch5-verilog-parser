@@ -177,6 +177,26 @@ module tb_itch;
         end
     end
 
+    // ---- protocol checks ----
+    // out_valid must be a ONE-clock pulse. Every message is at least
+    // 3 input bytes (2 length + 1 type), so two pulses can never be adjacent.
+    // in_ready must always be 1 in v1 (the parser never applies backpressure).
+    reg     prev_out_valid = 1'b0;
+    integer proto_errors   = 0;
+    always @(posedge clk) begin
+        if (!rst) begin
+            if (out_valid && prev_out_valid) begin
+                $display("ERROR: out_valid high for 2 cycles in a row at %0t", $time);
+                proto_errors = proto_errors + 1;
+            end
+            if (!in_ready) begin
+                $display("ERROR: in_ready dropped at %0t", $time);
+                proto_errors = proto_errors + 1;
+            end
+        end
+        prev_out_valid <= out_valid;
+    end
+
     // ---- main sequence ----
     reg [1023:0] out_path;
     integer cycles = 0;
@@ -185,6 +205,9 @@ module tb_itch;
         if (!$value$plusargs("SEED=%d", seed))       seed = 1;
         if (!$value$plusargs("OUT=%s", out_path))    out_path = "build/actual.txt";
         if ($test$plusargs("DUMP")) begin
+            // Waveform for GTKWave. Only the first 2,000 cycles are dumped
+            // (about 60 messages, including the first Add Orders), which
+            // keeps the file small.
             $dumpfile("build/wave.vcd");
             $dumpvars(0, tb_itch);
         end
@@ -199,6 +222,7 @@ module tb_itch;
         while (ptr < `STREAM_LEN && cycles < 100 * `STREAM_LEN) begin
             @(posedge clk);
             cycles = cycles + 1;
+            if (cycles == 2000) $dumpoff;    // no-op unless +DUMP
         end
         repeat (10) @(posedge clk);          // let the last message drain out
 
@@ -206,6 +230,7 @@ module tb_itch;
         $display("tb_itch: %0d bytes in %0d cycles, stall=%0d%%: %0d messages (%0d decoded, %0d skipped)",
                  `STREAM_LEN, cycles, stall_pct, seq, n_decoded, n_skipped);
         if (ptr < `STREAM_LEN) $fatal(1, "timeout: input not fully consumed");
+        if (proto_errors != 0) $fatal(1, "%0d protocol errors", proto_errors);
         $finish;
     end
 
