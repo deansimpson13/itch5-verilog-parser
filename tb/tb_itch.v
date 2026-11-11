@@ -38,11 +38,14 @@ module tb_itch;
 
     // ---- DUT outputs ----
     wire        out_valid, out_supported;
-    wire [7:0]  out_type, out_side;
-    wire [15:0] out_len, out_locate, out_tracking;
+    wire [7:0]  out_type, out_event, out_side, out_printable;
+    wire [15:0] out_len, out_locate, out_tracking, out_issue_subtype;
     wire [47:0] out_timestamp;
-    wire [63:0] out_order_ref, out_stock;
-    wire [31:0] out_shares, out_price;
+    wire [63:0] out_stock, out_order_ref, out_new_order_ref, out_match;
+    wire [31:0] out_shares, out_price, out_mpid, out_round_lot, out_etp_leverage;
+    wire [7:0]  out_mkt_cat, out_fin_status, out_round_lots_only, out_issue_class,
+                out_authenticity, out_ssti, out_ipo_flag, out_luld_tier,
+                out_etp_flag, out_inverse;
 
     itch_top dut (
         .clk(clk), .rst(rst),
@@ -50,8 +53,17 @@ module tb_itch;
         .out_valid(out_valid), .out_type(out_type), .out_len(out_len),
         .out_supported(out_supported),
         .out_locate(out_locate), .out_tracking(out_tracking), .out_timestamp(out_timestamp),
-        .out_order_ref(out_order_ref), .out_side(out_side), .out_shares(out_shares),
-        .out_stock(out_stock), .out_price(out_price)
+        .out_event(out_event), .out_stock(out_stock),
+        .out_order_ref(out_order_ref), .out_new_order_ref(out_new_order_ref),
+        .out_side(out_side), .out_shares(out_shares), .out_price(out_price),
+        .out_mpid(out_mpid), .out_match(out_match), .out_printable(out_printable),
+        .out_mkt_cat(out_mkt_cat), .out_fin_status(out_fin_status),
+        .out_round_lot(out_round_lot), .out_round_lots_only(out_round_lots_only),
+        .out_issue_class(out_issue_class), .out_issue_subtype(out_issue_subtype),
+        .out_authenticity(out_authenticity), .out_ssti(out_ssti),
+        .out_ipo_flag(out_ipo_flag), .out_luld_tier(out_luld_tier),
+        .out_etp_flag(out_etp_flag), .out_etp_leverage(out_etp_leverage),
+        .out_inverse(out_inverse)
     );
 
     // ---- driver ----
@@ -108,11 +120,55 @@ module tb_itch;
                 n_decoded = n_decoded + 1;
                 $fwrite(fd, " %c loc=%0d trk=%0d ts=%0d",
                         out_type, out_locate, out_tracking, out_timestamp);
+                // Field order and names match decode_fields() in itch_ref.py.
                 case (out_type)
-                    "A": begin
+                    "S": begin
+                        $fwrite(fd, " event=");       put_alpha(out_event, 1);
+                    end
+                    "R": begin
+                        $fwrite(fd, " stock=");       put_alpha(out_stock, 8);
+                        $fwrite(fd, " mkt=");         put_alpha(out_mkt_cat, 1);
+                        $fwrite(fd, " fsi=");         put_alpha(out_fin_status, 1);
+                        $fwrite(fd, " lot=%0d", out_round_lot);
+                        $fwrite(fd, " rlo=");         put_alpha(out_round_lots_only, 1);
+                        $fwrite(fd, " cls=");         put_alpha(out_issue_class, 1);
+                        $fwrite(fd, " sub=");         put_alpha(out_issue_subtype, 2);
+                        $fwrite(fd, " auth=");        put_alpha(out_authenticity, 1);
+                        $fwrite(fd, " ssti=");        put_alpha(out_ssti, 1);
+                        $fwrite(fd, " ipo=");         put_alpha(out_ipo_flag, 1);
+                        $fwrite(fd, " luld=");        put_alpha(out_luld_tier, 1);
+                        $fwrite(fd, " etp=");         put_alpha(out_etp_flag, 1);
+                        $fwrite(fd, " lev=%0d", out_etp_leverage);
+                        $fwrite(fd, " inv=");         put_alpha(out_inverse, 1);
+                    end
+                    "A", "F": begin
                         $fwrite(fd, " ref=%0d side=", out_order_ref);  put_alpha(out_side, 1);
                         $fwrite(fd, " shares=%0d stock=", out_shares); put_alpha(out_stock, 8);
                         $fwrite(fd, " price=");                        put_price(out_price);
+                        if (out_type == "F") begin
+                            $fwrite(fd, " mpid=");                     put_alpha(out_mpid, 4);
+                        end
+                    end
+                    "E": begin
+                        $fwrite(fd, " ref=%0d shares=%0d match=%0d",
+                                out_order_ref, out_shares, out_match);
+                    end
+                    "C": begin
+                        $fwrite(fd, " ref=%0d shares=%0d match=%0d printable=",
+                                out_order_ref, out_shares, out_match);
+                        put_alpha(out_printable, 1);
+                        $fwrite(fd, " price=");                        put_price(out_price);
+                    end
+                    "X": begin
+                        $fwrite(fd, " ref=%0d shares=%0d", out_order_ref, out_shares);
+                    end
+                    "D": begin
+                        $fwrite(fd, " ref=%0d", out_order_ref);
+                    end
+                    "U": begin
+                        $fwrite(fd, " oref=%0d nref=%0d shares=%0d price=",
+                                out_order_ref, out_new_order_ref, out_shares);
+                        put_price(out_price);
                     end
                     default: $fwrite(fd, " ???");   // decoder said supported but TB can't print it
                 endcase

@@ -19,7 +19,7 @@
 // The buffer approach keeps the offsets in one readable place (the case
 // statement below) that looks just like the spec tables. Grabbing fields
 // on the fly would need an offset comparison for every byte of every
-// field. Cost: BUF_BYTES x 8 flip-flops (312 for 39 bytes), which is
+// field. Cost: BUF_BYTES x 8 flip-flops (320 for 40 bytes), which is
 // tiny for any FPGA.
 //
 // out_supported = 1 only when the type is one this decoder knows AND the
@@ -29,7 +29,9 @@
 `timescale 1ns / 1ps
 
 module itch_decoder #(
-    parameter BUF_BYTES = 39            // largest supported message
+    // Must be >= the longest supported message: F (Add Order w/ MPID) = 40 bytes.
+    // (An early version used 39, sized for R. The testbench caught the lost MPID byte.)
+    parameter BUF_BYTES = 40
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -52,12 +54,33 @@ module itch_decoder #(
     output reg  [15:0] out_tracking,   // tracking number     @3, 2 bytes
     output reg  [47:0] out_timestamp,  // ns since midnight   @5, 6 bytes
 
-    // order fields (A)
-    output reg  [63:0] out_order_ref,  // order reference number
-    output reg  [7:0]  out_side,       // "B" or "S"
-    output reg  [31:0] out_shares,
-    output reg  [63:0] out_stock,      // 8 ASCII chars, first char in [63:56]
-    output reg  [31:0] out_price       // Price(4): 4 implied decimal places
+    // Fields shared by several types. Each comment lists the types that use it.
+    // A field a message doesn't have is output as 0.
+    output reg  [7:0]  out_event,         // S: system event code
+    output reg  [63:0] out_stock,         // R A F: 8 ASCII chars, first char in [63:56]
+    output reg  [63:0] out_order_ref,     // A F E C X D, U (original ref)
+    output reg  [63:0] out_new_order_ref, // U: new order reference number
+    output reg  [7:0]  out_side,          // A F: "B" or "S"
+    output reg  [31:0] out_shares,        // A F: shares; E C: executed; X: cancelled; U: new shares
+    output reg  [31:0] out_price,         // A F U: price; C: execution price. Price(4)
+    output reg  [31:0] out_mpid,          // F: attribution, 4 ASCII chars
+    output reg  [63:0] out_match,         // E C: match number
+    output reg  [7:0]  out_printable,     // C: "Y" or "N"
+
+    // Stock Directory (R) only
+    output reg  [7:0]  out_mkt_cat,       // market category
+    output reg  [7:0]  out_fin_status,    // financial status indicator
+    output reg  [31:0] out_round_lot,     // round lot size
+    output reg  [7:0]  out_round_lots_only,
+    output reg  [7:0]  out_issue_class,
+    output reg  [15:0] out_issue_subtype, // 2 ASCII chars
+    output reg  [7:0]  out_authenticity,
+    output reg  [7:0]  out_ssti,          // short sale threshold indicator
+    output reg  [7:0]  out_ipo_flag,
+    output reg  [7:0]  out_luld_tier,
+    output reg  [7:0]  out_etp_flag,
+    output reg  [31:0] out_etp_leverage,
+    output reg  [7:0]  out_inverse
 );
 
     // ------------------------------------------------------------------
@@ -112,8 +135,16 @@ module itch_decoder #(
         input [7:0] t;
         begin
             case (t)
+                "S":     spec_len = 16'd12;   // System Event         §1.1
+                "R":     spec_len = 16'd39;   // Stock Directory      §1.2.1
                 "A":     spec_len = 16'd36;   // Add Order            §1.3.1
-                default: spec_len = 16'd0;
+                "F":     spec_len = 16'd40;   // Add Order w/ MPID    §1.3.2
+                "E":     spec_len = 16'd31;   // Order Executed       §1.4.1
+                "C":     spec_len = 16'd36;   // Executed w/ Price    §1.4.2
+                "X":     spec_len = 16'd23;   // Order Cancel         §1.4.3
+                "D":     spec_len = 16'd19;   // Order Delete         §1.4.4
+                "U":     spec_len = 16'd35;   // Order Replace        §1.4.5
+                default: spec_len = 16'd0;    // anything else: skip
             endcase
         end
     endfunction
@@ -124,50 +155,112 @@ module itch_decoder #(
 
     // ------------------------------------------------------------------
     // Step 2: extract fields and pulse out_valid.
+    //
+    // Only out_valid needs a reset. The data outputs are "don't care"
+    // whenever out_valid is 0, so they're simply overwritten each message.
+    // (Fewer reset connections = smaller, faster logic. This is common practice.)
     // ------------------------------------------------------------------
     always @(posedge clk) begin
         if (rst) begin
-            out_valid     <= 1'b0;
-            out_type      <= 8'd0;
-            out_len       <= 16'd0;
-            out_supported <= 1'b0;
-            out_locate    <= 16'd0;
-            out_tracking  <= 16'd0;
-            out_timestamp <= 48'd0;
-            out_order_ref <= 64'd0;
-            out_side      <= 8'd0;
-            out_shares    <= 32'd0;
-            out_stock     <= 64'd0;
-            out_price     <= 32'd0;
+            out_valid <= 1'b0;
         end else begin
             out_valid <= done;               // one-clock pulse per message
-            if (done) begin
-                out_type      <= mtype;
-                out_len       <= len_q;
-                out_supported <= supported;
-                out_locate    <= be(1, 2);
-                out_tracking  <= be(3, 2);
-                out_timestamp <= be(5, 6);
+        end
 
-                // Clear the type-specific fields, then fill in the ones this type has.
-                out_order_ref <= 64'd0;
-                out_side      <= 8'd0;
-                out_shares    <= 32'd0;
-                out_stock     <= 64'd0;
-                out_price     <= 32'd0;
+        if (done) begin
+            out_type      <= mtype;
+            out_len       <= len_q;
+            out_supported <= supported;
+            out_locate    <= be(1, 2);
+            out_tracking  <= be(3, 2);
+            out_timestamp <= be(5, 6);
 
-                if (supported) begin
-                    case (mtype)
-                        "A": begin                    // Add Order §1.3.1
-                            out_order_ref <= be(11, 8);
-                            out_side      <= be(19, 1);
-                            out_shares    <= be(20, 4);
-                            out_stock     <= be(24, 8);
-                            out_price     <= be(32, 4);
-                        end
-                        default: ;                   // nothing extra
-                    endcase
-                end
+            // Start with every type-specific field at 0. Then the case
+            // statement fills in the fields this message type actually has.
+            // (In an always block, the LAST nonblocking assignment wins.)
+            out_event           <= 8'd0;
+            out_stock           <= 64'd0;
+            out_order_ref       <= 64'd0;
+            out_new_order_ref   <= 64'd0;
+            out_side            <= 8'd0;
+            out_shares          <= 32'd0;
+            out_price           <= 32'd0;
+            out_mpid            <= 32'd0;
+            out_match           <= 64'd0;
+            out_printable       <= 8'd0;
+            out_mkt_cat         <= 8'd0;
+            out_fin_status      <= 8'd0;
+            out_round_lot       <= 32'd0;
+            out_round_lots_only <= 8'd0;
+            out_issue_class     <= 8'd0;
+            out_issue_subtype   <= 16'd0;
+            out_authenticity    <= 8'd0;
+            out_ssti            <= 8'd0;
+            out_ipo_flag        <= 8'd0;
+            out_luld_tier       <= 8'd0;
+            out_etp_flag        <= 8'd0;
+            out_etp_leverage    <= 32'd0;
+            out_inverse         <= 8'd0;
+
+            // Offsets below are copied from docs/SPEC_NOTES.md.
+            // be(offset, number_of_bytes)
+            if (supported) begin
+                case (mtype)
+                    "S": begin                         // System Event §1.1
+                        out_event <= be(11, 1);
+                    end
+                    "R": begin                         // Stock Directory §1.2.1
+                        out_stock           <= be(11, 8);
+                        out_mkt_cat         <= be(19, 1);
+                        out_fin_status      <= be(20, 1);
+                        out_round_lot       <= be(21, 4);
+                        out_round_lots_only <= be(25, 1);
+                        out_issue_class     <= be(26, 1);
+                        out_issue_subtype   <= be(27, 2);
+                        out_authenticity    <= be(29, 1);
+                        out_ssti            <= be(30, 1);
+                        out_ipo_flag        <= be(31, 1);
+                        out_luld_tier       <= be(32, 1);
+                        out_etp_flag        <= be(33, 1);
+                        out_etp_leverage    <= be(34, 4);
+                        out_inverse         <= be(38, 1);
+                    end
+                    "A", "F": begin                    // Add Order §1.3.1 / §1.3.2
+                        out_order_ref <= be(11, 8);
+                        out_side      <= be(19, 1);
+                        out_shares    <= be(20, 4);
+                        out_stock     <= be(24, 8);
+                        out_price     <= be(32, 4);
+                        if (mtype == "F")
+                            out_mpid  <= be(36, 4);    // only F has attribution
+                    end
+                    "E": begin                         // Order Executed §1.4.1
+                        out_order_ref <= be(11, 8);
+                        out_shares    <= be(19, 4);
+                        out_match     <= be(23, 8);
+                    end
+                    "C": begin                         // Executed with Price §1.4.2
+                        out_order_ref <= be(11, 8);
+                        out_shares    <= be(19, 4);
+                        out_match     <= be(23, 8);
+                        out_printable <= be(31, 1);
+                        out_price     <= be(32, 4);
+                    end
+                    "X": begin                         // Order Cancel §1.4.3
+                        out_order_ref <= be(11, 8);
+                        out_shares    <= be(19, 4);
+                    end
+                    "D": begin                         // Order Delete §1.4.4
+                        out_order_ref <= be(11, 8);
+                    end
+                    "U": begin                         // Order Replace §1.4.5
+                        out_order_ref     <= be(11, 8);
+                        out_new_order_ref <= be(19, 8);
+                        out_shares        <= be(27, 4);
+                        out_price         <= be(31, 4);
+                    end
+                    default: ;                         // unreachable: supported=0
+                endcase
             end
         end
     end

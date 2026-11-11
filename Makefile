@@ -59,7 +59,7 @@ build/actual.txt: build/tb_itch.vvp data/stream.hex
 sim: build/tb_framer.vvp build/actual.txt
 
 decoder_test: build/actual.txt
-	$(PY) tools/compare.py build/expected.txt build/actual.txt --only 41
+	$(PY) tools/compare.py build/expected.txt build/actual.txt
 
 lint:
 	$(PY) tools/check_rtl.py
