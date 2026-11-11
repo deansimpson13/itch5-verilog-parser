@@ -21,8 +21,9 @@ STALL ?= 30
 SEED  ?= 1
 
 RTL_FRAMER = rtl/itch_framer.v
+RTL        = rtl/itch_framer.v rtl/itch_decoder.v rtl/itch_top.v
 
-.PHONY: all data sim test clean pytest framer_test
+.PHONY: all data sim test clean pytest framer_test decoder_test lint
 
 all: test
 
@@ -48,9 +49,22 @@ framer_test: build/tb_framer.vvp build/frames_expected.txt
 	$(VVP) -n build/tb_framer.vvp +STALL=$(STALL) +SEED=$(SEED) +OUT=build/frames_actual_stall.txt
 	$(PY) tools/compare.py build/frames_expected.txt build/frames_actual_stall.txt
 
-sim: build/tb_framer.vvp
+# ---- Phase 3+: full parser (framer + decoder) --------------------------------
+build/tb_itch.vvp: tb/tb_itch.v $(RTL) data/stream_len.vh build/expected.txt
+	$(IVERILOG) $(IVFLAGS) -o $@ tb/tb_itch.v $(RTL)
 
-test: pytest data framer_test
+build/actual.txt: build/tb_itch.vvp data/stream.hex
+	$(VVP) -n build/tb_itch.vvp +STALL=0 +OUT=build/actual.txt
+
+sim: build/tb_framer.vvp build/actual.txt
+
+decoder_test: build/actual.txt
+	$(PY) tools/compare.py build/expected.txt build/actual.txt --only 41
+
+lint:
+	$(PY) tools/check_rtl.py
+
+test: pytest data lint framer_test decoder_test
 
 clean:
 	$(PY) tools/clean.py

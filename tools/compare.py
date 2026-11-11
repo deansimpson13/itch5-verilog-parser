@@ -2,9 +2,11 @@
 """
 compare.py - Diff the golden model's output against the Verilog output.
 
-Usage:  python tools/compare.py build/expected.txt build/actual.txt
+Usage:  python tools/compare.py build/expected.txt build/actual.txt [--only 41,46]
 
 Prints PASS and exits 0 if the files match line for line.
+--only keeps just the lines whose type byte (t=..) is in the list, which is
+handy while only some message types are implemented.
 Otherwise it prints the FIRST mismatch with a few lines of context, says which
 field differs, and exits 1 (nonzero exit makes `make` stop and report failure).
 """
@@ -31,11 +33,22 @@ def field_diff(exp, act):
 
 
 def main(argv):
+    only = None
+    if "--only" in argv:
+        i = argv.index("--only")
+        only = {"t=" + code.lower() for code in argv[i + 1].split(",")}
+        argv = argv[:i] + argv[i + 2:]
     if len(argv) != 3:
         print(__doc__)
         return 2
     exp_path, act_path = argv[1], argv[2]
     exp, act = read_lines(exp_path), read_lines(act_path)
+    if only:
+        exp = [ln for ln in exp if ln.split()[1] in only]
+        act = [ln for ln in act if ln.split()[1] in only]
+        if not exp:
+            print(f"FAIL: no expected lines with type in {sorted(only)}")
+            return 1
 
     for i in range(min(len(exp), len(act))):
         if exp[i] != act[i]:
