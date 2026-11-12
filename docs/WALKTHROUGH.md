@@ -231,3 +231,65 @@ gtkwave build/wave.vcd
 In GTKWave, open `tb_itch → dut → u_framer` and `u_decoder`. Add `state`, `remaining`,
 `msg_valid`, `msg_data`, `pos`, `done`, and `out_valid`. The first Add Order in the generated
 stream is message 19.
+
+---
+
+## 6. How fast can it run? Fmax and the critical path
+
+`make synth` turns the Verilog into a real circuit for a Lattice iCE40-HX8K FPGA and reports how
+fast it can be clocked. Here is what those numbers mean.
+
+### Fmax
+
+Every flip-flop in the design updates on the clock edge. Between two edges, each signal has to
+leave one flip-flop, pass through some logic (LUTs) and wires, and **arrive at the next flip-flop
+before the next edge**, with a little time to spare (the "setup" time). If the clock ticks too
+fast, a signal is still on its way when the edge comes, and the flip-flop stores a wrong value.
+
+The time from one edge to the next is the **clock period**. **Fmax** ("maximum frequency") is the
+fastest clock at which every signal still arrives in time:
+
+```
+Fmax = 1 / (the longest flip-flop-to-flip-flop delay)
+```
+
+For this design on the iCE40, nextpnr measured the longest delay at about 11-12 ns, so
+Fmax ≈ 1 / 12.3 ns ≈ **81-92 MHz**. The number moves a little from run to run because the tool
+places the circuit with a random seed, and a different placement means different wire lengths.
+
+### The critical path
+
+The **critical path** is that longest flip-flop-to-flip-flop route: the one signal that limits
+Fmax. Speeding up anything else does nothing; only shortening this path raises Fmax.
+
+Ours starts at the framer's `msg_first` register (or, on some placements, the decoder's `offset`
+register, the other input to the same choice) and ends at the write-enable of one byte of the
+decoder's message buffer `mbuf`. In plain English, on every clock the decoder must answer:
+"**which of the 40 buffer slots does this byte go into?**" (`rtl/itch_decoder.v`, lines 95-106):
+
+1. `pos = msg_first ? 0 : offset`: choose the slot number. That's one LUT.
+2. `pos < BUF_BYTES`: is the slot inside the buffer? `pos` is 16 bits wide, so this is a
+   16-bit comparison, which the FPGA builds as a chain of 12 carry cells, one after another.
+3. Turn the slot number into 40 separate "write this byte" signals, one per slot. That's
+   a few more LUTs.
+4. Run those signals out to 320 flip-flops spread across the chip. **This is the slow part:**
+   measured, about 4 ns of the path is logic and 6.7–8.1 ns is just wire.
+
+So most of the time is spent not computing, but **getting one decision to 40 places that are far
+apart**. (Fixing it is a later step. Possible fixes: a 6-bit counter instead of 16 bits, so the
+comparison is shorter, or a "one-hot" pointer that already holds one bit per slot.)
+
+### Throughput
+
+The parser takes 1 byte per clock, so:
+
+```
+bytes per second = Fmax x 1 byte
+81 MHz x 1 byte = 81 MB/s = 0.65 Gb/s
+```
+
+10 Gb Ethernet delivers 10 Gb/s = 1,250 MB/s. At 1 byte per clock that would need a 1,250 MHz
+clock. That is far beyond what FPGA logic like this runs at (typically tens to a few hundred MHz),
+even on expensive chips. So this parser reaches about 6.5% of 10GbE line
+rate. Real 10GbE designs move **8 bytes per clock** (a 64-bit bus) at 156.25 MHz instead, and that
+is the direction a future version would have to go.

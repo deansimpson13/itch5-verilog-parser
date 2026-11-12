@@ -160,6 +160,21 @@ realdata: real_crosscheck real_sanity real_sim_test
 	@echo   REAL DATA CHECKS PASSED - reports in build/real/
 	@echo ==================================================
 
+# ---- Synthesis (phase 7) -----------------------------------------------------
+# Real resource and clock-speed numbers from free FPGA tools (Yosys + nextpnr,
+# from the YosysHQ OSS CAD Suite). Not part of `make test`.
+#   iCE40-HX8K:  LUTs, flip-flops, and Fmax after place-and-route
+#   Artix-7:     LUTs and flip-flops after synthesis (no place-and-route)
+# tools/synth_report.py finds the tools on PATH, or in ~/oss-cad-suite
+# (override with OSS_CAD_SUITE=<folder>). Results: build/synth/summary.txt
+YOSYS         ?= yosys
+NEXTPNR_ICE40 ?= nextpnr-ice40
+SYNTH_SEEDS   ?= 1,2,3,4,5
+
+.PHONY: synth
+synth: lint
+	$(PY) tools/synth_report.py --yosys $(YOSYS) --nextpnr $(NEXTPNR_ICE40) --seeds $(SYNTH_SEEDS)
+
 # ---- Cleanup -----------------------------------------------------------------
 clean:
 	$(PY) tools/clean.py

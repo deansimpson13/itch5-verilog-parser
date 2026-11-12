@@ -89,6 +89,16 @@ D 58,211 · U 19,038. Reports are written to `build/real/`.
 On Windows, the Icarus installer puts its tools in `C:\iverilog\bin` and `C:\iverilog\gtkwave\bin`.
 Add both folders to your PATH. If your Python is called `python3`, run `make test PY=python3`.
 
+**Only for `make synth`:** the [YosysHQ OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build/releases)
+(this project used build `2026-10-01`). Extract it to `~/oss-cad-suite` (on Windows,
+`C:\Users\<you>\oss-cad-suite`), or set `OSS_CAD_SUITE` to wherever you put it. **Don't add it to
+your PATH:** it bundles its own `iverilog` and `python`, which would replace yours. `make synth`
+adds it to the PATH only for the commands it runs. On Windows, Smart App Control may warn that
+it blocked `Qt6Gui.dll` for `nextpnr-ice40`. That DLL is only used by nextpnr's optional GUI, so
+the warning doesn't affect `make synth`.
+
+**Only for `make realdata`:** internet access. It installs MeatPy into `build/venv` by itself.
+
 ### Commands
 
 ```
@@ -100,6 +110,7 @@ make distclean    # clean + delete data/real/
 
 make realdata     # real NASDAQ data: fetch slice, MeatPy cross-check, sanity checks,
                   # Verilog sim. Needs internet the first time; ~5 minutes; not part of `make test`
+make synth        # Yosys + nextpnr: LUTs, flip-flops, Fmax -> build/synth/summary.txt (~30 s)
 
 make walkthrough  # cycle-by-cycle trace of one Add Order (see docs/WALKTHROUGH.md)
 make wave         # build/wave.vcd, then: gtkwave build/wave.vcd
@@ -134,7 +145,33 @@ itch_top
 
 - **Throughput:** 1 byte/clock with no gaps between messages.
 - **Latency:** 2 clocks from the last byte of a message to `out_valid`.
-- **Size:** a 40-byte message buffer (320 flip-flops) plus the output registers.
+- **Size and speed:** see [Synthesis](#synthesis) below (measured).
+
+## Synthesis
+
+`make synth` (Yosys + nextpnr from the YosysHQ OSS CAD Suite). All numbers are measured by the
+tools. Raw reports are in `build/synth/`.
+
+| Target | Tool flow | LUTs | Flip-flops | Fmax |
+|---|---|---|---|---|
+| Lattice iCE40-HX8K (ct256), `itch_top` alone | Yosys `synth_ice40` | 355 LUT4 (+40 carry) | 1,050 | n/a |
+| iCE40-HX8K, `itch_top` + scan-chain wrapper | Yosys + nextpnr-ice40 place & route | 1,885 / 7,680 logic cells (25%) | 1,691 | **81.28–91.95 MHz** (5 seeds; median 88.09) |
+| Xilinx Artix-7, `itch_top` alone | Yosys `synth_xilinx`, **post-synthesis only, not placed or routed** | 970 (+176 MUXF7, 8 MUXF8, 9 CARRY4) | 1,050 | not measured (no Vivado) |
+
+- **Throughput** at the worst-seed Fmax: 81.28 MHz × 1 byte/clock = **81 MB/s = 0.65 Gb/s**.
+- **10 Gb Ethernet:** line rate is 10 Gb/s = 1,250 MB/s, which would need a 1,250 MHz clock at
+  1 byte/clock. **It does not keep up: it reaches 6.5% of 10GbE line rate.**
+- **Critical path:** the decoder deciding which of the 40 buffer slots each byte goes into. It
+  starts with a 16-bit `pos < 40` comparison built as a 12-cell carry chain, then the write-enable
+  is routed out to the buffer flip-flops. About two thirds of the delay is wire, not logic.
+  [WALKTHROUGH.md §6](docs/WALKTHROUGH.md#6-how-fast-can-it-run-fmax-and-the-critical-path)
+  explains this for beginners.
+- **Why a wrapper:** `itch_top` has 642 output bits and the HX8K has 206 pins. `synth/synth_top.v`
+  loads every output into a shift register that leaves through one pin, so no logic can be
+  optimized away. The parser's own size is the "alone" row.
+- **Checks that nothing was optimized away:** Yosys `check -assert` is clean, and no output bit is
+  a constant (except `in_ready`, which is 1 by design). There are at least 962 flip-flops (320
+  buffer + 642 output registers); the measured count is 1,050.
 
 ## Repo layout
 
@@ -144,6 +181,8 @@ rtl/                     synthesizable design
   itch_framer.v            length-prefix FSM: finds message boundaries
   itch_decoder.v           byte buffer + offset-based field extraction
   itch_top.v               framer -> decoder
+synth/
+  synth_top.v              scan-chain wrapper so itch_top fits the FPGA's pins (make synth only)
 tb/                      testbenches (simulation only)
   tb_framer.v              phase 2: framer alone, boundary/beat checks
   tb_itch.v                full parser, random stalls, writes actual.txt
@@ -160,6 +199,7 @@ tools/
   sanity_real.py           parser-independent consistency checks on real data
   venv_run.py              runs a script inside build/venv (where MeatPy is installed)
   requirements-realdata.txt  pinned MeatPy version (only for `make realdata`)
+  synth_report.py          runs Yosys/nextpnr, checks nothing was optimized away, reports
 docs/
   SPEC_NOTES.md            field offset tables from the ITCH 5.0 PDF, with section citations
   DECISIONS.md             design choices and why
@@ -181,6 +221,7 @@ Each phase was committed only after its tests passed (see `git log`):
 5. Edge cases, stall tests, protocol checks, docs
 6. Real NASDAQ data: an outside parser (MeatPy) cross-check, parser-independent sanity checks,
    and the Verilog run on 500,000 real messages. No mismatches were found.
+7. Synthesis with free tools: measured LUTs, flip-flops, and Fmax replace the old estimate.
 
 ## References
 
