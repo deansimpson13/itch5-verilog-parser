@@ -1,0 +1,8 @@
+# Packages for `make realdata` only (installed into build/venv, never globally).
+# `make test` still needs nothing beyond the Python standard library.
+#
+# MeatPy is the OUTSIDE ITCH 5.0 parser used by tools/cross_check.py.
+# Pinned so the cross-check always runs against the same code.
+# See docs/DECISIONS.md, "Real-data validation", for why this parser.
+meatpy==0.5.0
+pyarrow==26.0.1   # MeatPy dependency (not used by our scripts), pinned too

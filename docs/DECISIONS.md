@@ -96,8 +96,107 @@ Spec ambiguities are covered in [SPEC_NOTES.md](SPEC_NOTES.md#ambiguities-and-th
 
 ## Golden model (tools/itch_ref.py)
 
-- **The reference parser is checked independently.** `tools/test_ref.py` builds an Add Order by
-  hand, byte by byte from the spec table, and checks the decoded line. This catches a bug that the
-  generator and parser might otherwise share.
+- **The reference parser is checked against hand-built bytes.** `tools/test_ref.py` builds an Add
+  Order by hand, byte by byte from the spec table, and checks the decoded line. This catches a bug
+  that the generator and parser might otherwise share. It is still our own reading of the spec,
+  though. The truly independent check is the outside parser (see "Real-data validation" below).
 - **A truncated file is an error in Python.** The Verilog can't "raise"; it just never finishes the
   last message. The generator never writes truncated files, so the two never meet in a test.
+
+## Real-data validation (phase 6)
+
+Why: the generator, golden model, and Verilog all came from the same notes in SPEC_NOTES.md. A
+field misread there would be misread identically in all three, and `make test` would still pass.
+Real NASDAQ bytes plus a parser we didn't write close that gap.
+
+### The data (tools/fetch_real.py)
+
+- **File:** `01302019.NASDAQ_ITCH50.gz` from NASDAQ's sample directory
+  (`https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/`), a full trading day (30 Jan 2019, 4.7 GB gzipped).
+  It's an older, fixed file that won't change, and it has a published `.md5sum`.
+- **Streamed, not downloaded.** The script reads the gzip over HTTP 1 MB at a time, decompresses
+  incrementally with `zlib.decompressobj(wbits=31)`, walks the 2-byte length prefixes to split
+  messages, and closes the connection once it has what it needs. About 135 MB of the 4.7 GB are
+  downloaded, which takes about 13 seconds.
+- **Two windows, not "the first 100,000 messages".** A measurement before writing the script showed
+  the first 100,000 messages would test almost nothing:
+  - Messages 1 to about 220,000 contain **no orders at all**: S, then 8,713 R (one per symbol),
+    then H, Y, and L. Orders start at 04:00.
+  - In the first 2 million messages there are **0 C** (Order Executed With Price), 49 F, and
+    1,851 E. Executions mostly happen after the 09:30 open.
+
+  So the slice is the day's **first 300,000 messages** (every R, the opening S events, and the first
+  ~80,000 pre-market order messages) followed by **200,000 messages starting at the first timestamp
+  ≥ 09:30:00** (message 10,532,164 of the day). That gives 500,000 messages in 16 MB. Every v1 type
+  appears, the rarest being S (3) and C (138).
+- **Pinned by SHA-256.** The script checks both windows against hashes recorded on the first run
+  (and confirmed with a second, independent fetch). A changed or corrupted file stops the run
+  instead of silently testing different data. Cached copies in `data/real/` are reused if the
+  hashes match.
+- **Not committed.** `data/` is gitignored. `make clean` keeps `data/real/` so you don't
+  re-download after every clean; `make distclean` removes it.
+
+### The outside parser (tools/cross_check.py)
+
+- **MeatPy 0.5.0** (https://github.com/vgreg/MeatPy, BSD-3), pinned in
+  `tools/requirements-realdata.txt`. Why this one:
+  - It's written and maintained by finance academics (V. Grégoire, HEC Montréal;
+    C. Martineau, U. of Toronto), has been used for research on exactly this kind of NASDAQ data,
+    and supports ITCH 2.0 through 5.0.
+  - It's pure Python and on PyPI, so it installs on Windows with no compiler. A Rust or C++ parser
+    would add a toolchain to `make realdata`.
+  - **It decodes differently from us.** It uses `struct` format strings (e.g. `"!HHHIQcI8sI"` for
+    `A`) where we use explicit byte offsets, splits the 6-byte timestamp into a 2-byte + 4-byte
+    unpack, and does its own framing. So a shared mistake is unlikely.
+  - Considered and not used: `itchfeed` (PyPI). It's less widely used, and one outside parser is
+    enough for this check.
+- **Installed in a private venv** (`build/venv`, created by `tools/venv_run.py`), so `make test`
+  still uses only the standard library.
+- **What's compared:** for the 9 v1 types, every field we print (header + type fields), as text.
+  For the other types, type byte and length. On MeatPy's side, the field values are formatted by
+  code in cross_check.py, not by itch_ref.py, so only the printing convention (price as
+  `whole.ffff`, space as `_`) is shared. That convention is a choice, not a spec reading.
+- **Result: 0 mismatches** in 2,689,914 fields. Nothing disagreed, so no spec dispute needed resolving.
+- **The cross-check was checked.** A scratch copy of itch_ref.py with X's shares offset changed
+  19 → 18 gives `FAIL: 13,925 mismatching fields`, names `X shares`, and exits 1.
+
+  An interesting near-miss: changing it 19 → **20** was *not* caught. X is 23 bytes, so reading 4
+  bytes from 20 gets only the last 3 bytes of the field, and every real share count is below 2²⁴,
+  so those 3 bytes give the same number. Real data can hide a bug that only shows on large values.
+  The synthetic stream's max-value edge cases (shares = 2³²−1) are what catch it. **The two kinds of
+  test cover each other's gaps,** which is why `make test` keeps the synthetic data.
+
+### Sanity checks (tools/sanity_real.py)
+
+These don't ask two parsers to agree. They check that the decoded values make sense together,
+which a misread field would break:
+
+- **Order lifecycle:** each E/C/X/D/U must find a live order added earlier by A/F/U, on the same
+  stock locate, with enough shares left. U retires the old ref and adds the new one; E/C/X that
+  reach zero shares retire the order. Results:
+  - **Start window:** 45,824 lookups, **0 misses.** (It begins with the day's first message, so
+    every order is visible.)
+  - **Open window:** 50.8% misses, which is expected because those orders were added before 09:30.
+    Misses are reported, not failed, as asked.
+- **Time:** timestamps never decrease within a window, and are all before midnight. The two windows
+  are checked separately, since time jumps from 04:02 to 09:30 between them.
+- **Symbols:** every A/F stock symbol matches the R message for its locate code (8,713 codes).
+- **Ranges:** 0 < price ≤ $200,000.0000 (the Price(4) maximum); shares ≤ 10,000,000; code fields
+  (event, side, printable, and the R flags) must be values listed in the spec, which I re-checked
+  against the PDF (§1.2.1 pp. 6–8). The largest price seen was $199,999.99, a market-maker
+  "stub quote", which is a placeholder price far from the market but legal.
+
+### The Verilog on real data
+
+- **The same testbench**, `tb/tb_itch.v`, compiled a second time into `build/real/` with
+  `-I data/real`, so `STREAM_LEN` comes from the real slice's `stream_len.vh` and sizes the memory to
+  16,071,175 bytes. A new `+HEX=<file>` plusarg points `$readmemh` at the real hex file. The default
+  is unchanged, so `make test` behaves exactly as before.
+- **$readmemh at 16 MB is fine in Icarus.** Measured on the back-to-back run: 622 MB peak memory
+  and 102 seconds. Two runs (back-to-back, and 30% stalls) instead of `make test`'s three keep `make realdata`
+  to about 5 minutes. The 75% run adds little on real data that the synthetic test doesn't already cover.
+- **Two testbench hardening fixes:**
+  - The timeout was `cycles < 100 * STREAM_LEN`, a 32-bit product that would overflow above about
+    21 MB. It's now `cycles / 100 < STREAM_LEN`.
+  - The testbench now `$fatal`s if the hex file is shorter than `STREAM_LEN` (a stale
+    `stream_len.vh`), instead of feeding X's into the parser.

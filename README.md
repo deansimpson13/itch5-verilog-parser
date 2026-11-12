@@ -1,7 +1,10 @@
 # ITCH 5.0 Parser in Verilog, Verified Against a Python Golden Model
 
 A hardware parser for **NASDAQ TotalView-ITCH 5.0** market data, written in synthesizable Verilog.
-Every message it decodes is checked field by field against an independent Python reference parser.
+Every message it decodes is checked field by field against a Python reference model (the "golden
+model"). The golden model and the Verilog were written from the same spec notes, so they could
+share a misreading. The independent check is an outside open-source parser,
+[MeatPy](https://github.com/vgreg/MeatPy), run on **real NASDAQ data**.
 
 ITCH is the binary feed NASDAQ uses to publish every order added to, executed on, or removed from
 its book. Trading firms often parse it in FPGAs, because hardware can decode a message in a few
@@ -51,6 +54,28 @@ unknown type bytes, and v1 types whose length prefix doesn't match the spec.
 zero price, a 1-byte message, a 300-byte message, `A` messages with too-short and too-long lengths,
 a zero-length record, 20 back-to-back minimum-size messages, and a timestamp at the day's last nanosecond.
 
+### Real NASDAQ data
+
+`make realdata` (needs internet the first time) streams a slice of NASDAQ's published sample file
+`01302019.NASDAQ_ITCH50.gz` (30 Jan 2019) without downloading the whole 4.7 GB. The slice is two
+windows: the day's first 300,000 messages, and 200,000 messages from the 09:30 market open.
+That's **500,000 messages (16,071,175 bytes)**.
+
+| Check | Result |
+|---|---|
+| Outside parser [MeatPy](https://github.com/vgreg/MeatPy) 0.5.0 vs our Python model, every field of every v1 message | **282,066 messages, 2,689,914 fields, 0 mismatches** |
+| Same, for the 217,934 non-v1 messages (H Y L P Q I) | type and length match for all |
+| Verilog vs Python model, back-to-back input | 500,000 / 500,000 lines identical |
+| Verilog vs Python model, 30% random `in_valid` stalls | 500,000 / 500,000 lines identical |
+| Every E/C/X/D/U refers to a live order on the same stock, with enough shares left: start window | 45,824 lookups, **0 misses** |
+| Same, open window (orders added before 09:30 are unknown, so misses are expected) | 46,273 lookups, 23,494 not found (50.8%), no other errors |
+| Timestamps never go backwards (each window) | pass |
+| Every A/F symbol matches its Stock Directory (R) entry (8,713 symbols) | pass |
+| Prices, share counts, and code fields in range / allowed by the spec | pass |
+
+Messages by type in the slice: S 3 · R 8,713 · A 95,177 · F 86,076 · E 785 · C 138 · X 13,925 ·
+D 58,211 · U 19,038. Reports are written to `build/real/`.
+
 ## How to run
 
 ### Prerequisites
@@ -70,7 +95,11 @@ Add both folders to your PATH. If your Python is called `python3`, run `make tes
 make test         # everything: generate data, run all sims, compare -> ALL TESTS PASSED
 make data         # just the synthetic stream + Python expected output
 make sim          # just build/run the Verilog simulations
-make clean        # delete build/ and data/
+make clean        # delete build/ and data/ (keeps the cached real slice in data/real/)
+make distclean    # clean + delete data/real/
+
+make realdata     # real NASDAQ data: fetch slice, MeatPy cross-check, sanity checks,
+                  # Verilog sim. Needs internet the first time; ~5 minutes; not part of `make test`
 
 make walkthrough  # cycle-by-cycle trace of one Add Order (see docs/WALKTHROUGH.md)
 make wave         # build/wave.vcd, then: gtkwave build/wave.vcd
@@ -125,18 +154,24 @@ tools/
   compare.py               diff with context, nonzero exit on mismatch
   test_ref.py              unit tests for itch_ref.py and compare.py
   check_rtl.py             rejects non-synthesizable code in rtl/
-  clean.py                 cross-platform `make clean`
+  clean.py                 cross-platform `make clean` / `make distclean`
+  fetch_real.py            streams a pinned slice of a real NASDAQ file -> data/real/
+  cross_check.py           outside parser (MeatPy) vs itch_ref.py, every field
+  sanity_real.py           parser-independent consistency checks on real data
+  venv_run.py              runs a script inside build/venv (where MeatPy is installed)
+  requirements-realdata.txt  pinned MeatPy version (only for `make realdata`)
 docs/
   SPEC_NOTES.md            field offset tables from the ITCH 5.0 PDF, with section citations
   DECISIONS.md             design choices and why
   WALKTHROUGH.md           one Add Order through Python and Verilog, for beginners
 ```
 
-`data/` and `build/` are generated and not committed.
+`data/` and `build/` are generated and not committed. That includes the real NASDAQ slice in
+`data/real/`, which is NASDAQ's data.
 
 ## How it was built
 
-Five phases, each committed only after its tests passed (see `git log`):
+Each phase was committed only after its tests passed (see `git log`):
 
 1. Python generator, golden model, and expected output
 2. Verilog framer, checked against Python message boundaries
@@ -144,6 +179,8 @@ Five phases, each committed only after its tests passed (see `git log`):
 4. The remaining v1 types. The comparison caught a real bug here: the buffer was one byte too
    small for the 40-byte `F` message.
 5. Edge cases, stall tests, protocol checks, docs
+6. Real NASDAQ data: an outside parser (MeatPy) cross-check, parser-independent sanity checks,
+   and the Verilog run on 500,000 real messages. No mismatches were found.
 
 ## References
 

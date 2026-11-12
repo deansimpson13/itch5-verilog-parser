@@ -14,6 +14,12 @@
 // contains no $display/$fwrite, because real hardware can't print.
 //
 // Plusargs:  +STALL=<0..99>  +SEED=<n>  +OUT=<file>  +DUMP (write build/wave.vcd)
+//            +HEX=<file>  input hex file (default data/stream.hex)
+//
+// Stream length: STREAM_LEN comes from stream_len.vh, found through the
+// iverilog -I path. `make test` compiles with -I data (synthetic stream);
+// `make realdata` compiles a second copy with -I data/real (real NASDAQ
+// slice, ~16 MB), so the memory below is sized to whichever stream is used.
 // ============================================================================
 `timescale 1ns / 1ps
 `include "stream_len.vh"
@@ -199,11 +205,13 @@ module tb_itch;
 
     // ---- main sequence ----
     reg [1023:0] out_path;
+    reg [1023:0] hex_path;
     integer cycles = 0;
     initial begin
         if (!$value$plusargs("STALL=%d", stall_pct)) stall_pct = 0;
         if (!$value$plusargs("SEED=%d", seed))       seed = 1;
         if (!$value$plusargs("OUT=%s", out_path))    out_path = "build/actual.txt";
+        if (!$value$plusargs("HEX=%s", hex_path))    hex_path = "data/stream.hex";
         if ($test$plusargs("DUMP")) begin
             // Waveform for GTKWave. Only the first 2,000 cycles are dumped
             // (about 60 messages, including the first Add Orders), which
@@ -212,14 +220,24 @@ module tb_itch;
             $dumpvars(0, tb_itch);
         end
 
-        $readmemh("data/stream.hex", mem);
+        // Fill the last byte with a marker first: if the hex file is shorter
+        // than STREAM_LEN (wrong stream_len.vh for this file), $readmemh
+        // leaves it alone and we stop with a clear error instead of feeding
+        // X's into the parser.
+        mem[`STREAM_LEN-1] = 8'hxx;
+        $readmemh(hex_path, mem);
+        if (^mem[`STREAM_LEN-1] === 1'bx)
+            $fatal(1, "hex file is shorter than STREAM_LEN=%0d (stale stream_len.vh?)",
+                   `STREAM_LEN);
         fd = $fopen(out_path, "w");
         if (fd == 0) $fatal(1, "cannot open output file");
 
         repeat (3) @(posedge clk);
         rst <= 1'b0;
 
-        while (ptr < `STREAM_LEN && cycles < 100 * `STREAM_LEN) begin
+        // Timeout after 100 cycles per byte. Written as cycles/100 so the
+        // product can't overflow a 32-bit integer on a big stream.
+        while (ptr < `STREAM_LEN && cycles / 100 < `STREAM_LEN) begin
             @(posedge clk);
             cycles = cycles + 1;
             if (cycles == 2000) $dumpoff;    // no-op unless +DUMP
