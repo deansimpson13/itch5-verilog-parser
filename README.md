@@ -154,16 +154,22 @@ tools. Raw reports are in `build/synth/`.
 
 | Target | Tool flow | LUTs | Flip-flops | Fmax |
 |---|---|---|---|---|
-| Lattice iCE40-HX8K (ct256), `itch_top` alone | Yosys `synth_ice40` | 355 LUT4 (+40 carry) | 1,050 | n/a |
-| iCE40-HX8K, `itch_top` + scan-chain wrapper | Yosys + nextpnr-ice40 place & route | 1,885 / 7,680 logic cells (25%) | 1,691 | **81.28–91.95 MHz** (5 seeds; median 88.09) |
-| Xilinx Artix-7, `itch_top` alone | Yosys `synth_xilinx`, **post-synthesis only, not placed or routed** | 970 (+176 MUXF7, 8 MUXF8, 9 CARRY4) | 1,050 | not measured (no Vivado) |
+| Lattice iCE40-HX8K (ct256), `itch_top` alone | Yosys `synth_ice40` | 331 LUT4 (+20 carry) | 1,040 | n/a |
+| iCE40-HX8K, `itch_top` + scan-chain wrapper | Yosys + nextpnr-ice40 place & route | 1,866 / 7,680 logic cells (24%) | 1,681 | **90.89–96.95 MHz** (5 seeds; median 95.90) |
+| Xilinx Artix-7, `itch_top` alone | Yosys `synth_xilinx`, **post-synthesis only, not placed or routed** | 964 (+178 MUXF7, 8 MUXF8, 6 CARRY4) | 1,040 | not measured (no Vivado) |
 
-- **Throughput** at the worst-seed Fmax: 81.28 MHz × 1 byte/clock = **81 MB/s = 0.65 Gb/s**.
+- **Throughput** at the worst-seed Fmax: 90.89 MHz × 1 byte/clock = **91 MB/s = 0.73 Gb/s**.
 - **10 Gb Ethernet:** line rate is 10 Gb/s = 1,250 MB/s, which would need a 1,250 MHz clock at
-  1 byte/clock. **It does not keep up: it reaches 6.5% of 10GbE line rate.**
-- **Critical path:** the decoder deciding which of the 40 buffer slots each byte goes into. It
-  starts with a 16-bit `pos < 40` comparison built as a 12-cell carry chain, then the write-enable
-  is routed out to the buffer flip-flops. About two thirds of the delay is wire, not logic.
+  1 byte/clock. **It does not keep up: it reaches 7.3% of 10GbE line rate.**
+- **Critical path:** two paths are now almost tied (10.3–11.0 ns), and both are mostly wire:
+  - Deciding which of the 40 buffer slots each byte goes into, then routing the write-enable out
+    to the buffer.
+  - Reading the message's type byte, checking its length, and clearing the output fields that
+    type doesn't have.
+
+  The first path used to be much slower: its 16-bit position counter made `pos < 40` a 12-cell
+  carry chain. A 6-bit saturating counter fixed that, and the worst-seed Fmax went from
+  81.28 to 90.89 MHz (see docs/DECISIONS.md, "Critical-path fix").
   [WALKTHROUGH.md §6](docs/WALKTHROUGH.md#6-how-fast-can-it-run-fmax-and-the-critical-path)
   explains this for beginners.
 - **Why a wrapper:** `itch_top` has 642 output bits and the HX8K has 206 pins. `synth/synth_top.v`
@@ -171,7 +177,7 @@ tools. Raw reports are in `build/synth/`.
   optimized away. The parser's own size is the "alone" row.
 - **Checks that nothing was optimized away:** Yosys `check -assert` is clean, and no output bit is
   a constant (except `in_ready`, which is 1 by design). There are at least 962 flip-flops (320
-  buffer + 642 output registers); the measured count is 1,050.
+  buffer + 642 output registers); the measured count is 1,040.
 
 ## Repo layout
 
@@ -222,6 +228,8 @@ Each phase was committed only after its tests passed (see `git log`):
 6. Real NASDAQ data: an outside parser (MeatPy) cross-check, parser-independent sanity checks,
    and the Verilog run on 500,000 real messages. No mismatches were found.
 7. Synthesis with free tools: measured LUTs, flip-flops, and Fmax replace the old estimate.
+8. Critical-path fix: the decoder's write counter went from 16 bits to a 6-bit saturating counter.
+   Worst-seed Fmax went from 81.28 to 90.89 MHz.
 
 ## References
 

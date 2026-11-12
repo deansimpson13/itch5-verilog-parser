@@ -92,7 +92,9 @@ Spec ambiguities are covered in [SPEC_NOTES.md](SPEC_NOTES.md#ambiguities-and-th
   and on a missing line. During development, changing one decoder offset (X shares 19 → 20) was
   confirmed to make `make test` fail with a clear message.
 - **iverilog uses `-g2012`** so the testbenches can use `$fatal`, which gives `vvp` a nonzero exit
-  code on failure. The RTL uses only Verilog-2001 constructs.
+  code on failure. The RTL uses Verilog-2001 constructs plus `$clog2` (Verilog-2005, a
+  compile-time constant that every synthesis tool supports). `check_rtl.py` allows `$clog2` and
+  still rejects every other `$` task.
 
 ## Golden model (tools/itch_ref.py)
 
@@ -255,6 +257,10 @@ which a misread field would break:
 
 ### Fmax
 
+> **These are the "before" numbers**, measured in phase 7 with the original 16-bit write counter.
+> The fix and the current numbers are in "Critical-path fix (phase 8)" below. Flip-flop counts
+> elsewhere in this section (1,050; 1,691) are also "before" values; they're now 1,040 and 1,681.
+
 - **5 placement seeds** (`SYNTH_SEEDS ?= 1,2,3,4,5`): 91.95, 88.64, 88.09, 83.42, 81.28 MHz.
   nextpnr's random placement changes wire lengths, so one seed can mislead. The README gives the
   range, and **throughput uses the worst seed** (81.28 MHz).
@@ -283,3 +289,88 @@ which a misread field would break:
   8-bit case above (1,042 is still over 962). A hand count from the RTL gives about 1,049 (framer
   54 + decoder 995), and Yosys reports 1,050. The floor is deliberately not set to that exact
   count, because a different Yosys version could legitimately merge a register or two.
+
+## Critical-path fix (phase 8)
+
+### The change
+
+`rtl/itch_decoder.v`: the write-position counter (`offset`, and `pos`, which is computed from it)
+went from 16 bits to `OFF_W = $clog2(BUF_BYTES + 1)` bits, which is 6 for the 40-byte buffer.
+It also **saturates**: it counts up to all-ones (63) and stays there. Nothing else in the design
+changed.
+
+- **Why 6 bits is enough:** the counter only has to reach "past the end of the buffer" (40). Six
+  bits count to 63.
+- **Why it's sized from `BUF_BYTES`:** `$clog2(BUF_BYTES + 1)` bits can always hold `BUF_BYTES`
+  itself, so the saturated value (all ones) is always ≥ `BUF_BYTES` and never a real slot. If
+  someone grows the buffer, the counter grows with it, so it can't silently become too small. For
+  example, `BUF_BYTES = 64` gives 7 bits.
+- **Why saturate instead of wrap (tested, not assumed):** with a plain 6-bit counter, `make test`
+  fails at `decoder_test`:
+  ```
+  FAIL: mismatch at line 2022 (build/expected.txt vs build/actual.txt)
+    > exp    2022: 2022 t=54 len=300 SKIP
+    > act    2022: 2022 t=ff len=300 SKIP
+  ```
+  The 300-byte edge-case message is `T` followed by bytes 0x00..0xFF. A wrapping counter goes
+  63 → 0, so message bytes 64, 128, 192, and 256 each land in `mbuf[0]`, the type byte. The last
+  one, byte 256 = 0xFF, wins, so the message is reported as type `ff`. The damage stays inside
+  that one message, because `msg_first` restarts the next message at slot 0, and it's skipped
+  anyway (no supported type is that long). But `out_type` is wrong, and the test caught it.
+  With saturation, `pos` sticks at 63 (not a slot), so bytes 40..299 are simply not stored.
+- **Lint:** `$clog2` is a `$` function, which `tools/check_rtl.py` used to reject. It's now
+  explicitly allowed, because it's evaluated by the compiler and never becomes hardware. Every
+  other `$` name is still rejected (checked: `$display`, `$random`, `$clog2x`).
+
+### Results (same tools, same seeds, same flow as phase 7)
+
+`make test` passes, `make realdata` passes, and `make synth` gives:
+
+| nextpnr seed | Fmax before (16-bit counter) | Fmax after (6-bit saturating) | Change |
+|---|---|---|---|
+| 1 | 91.95 MHz | 95.90 MHz | +4.3% |
+| 2 | 88.64 MHz | 96.95 MHz | +9.4% |
+| 3 | 88.09 MHz | 96.75 MHz | +9.8% |
+| 4 | 83.42 MHz | 90.89 MHz | +9.0% |
+| 5 | 81.28 MHz | 95.51 MHz | +17.5% |
+| **median** | **88.09 MHz** | **95.90 MHz** | **+8.9%** |
+| **worst** | **81.28 MHz** | **90.89 MHz** | **+11.8%** |
+
+| Resource | Before | After | Change |
+|---|---|---|---|
+| iCE40 `itch_top` LUT4 | 355 | 331 | −24 |
+| iCE40 `itch_top` carry cells | 40 | 20 | −20 |
+| iCE40 `itch_top` flip-flops | 1,050 | 1,040 | −10 (`offset` is 6 bits, not 16) |
+| iCE40 placed design, logic cells | 1,885 (25%) | 1,866 (24%) | −19 |
+| Artix-7 LUTs (post-synthesis) | 970 | 964 | −6 |
+| Artix-7 flip-flops | 1,050 | 1,040 | −10 |
+
+Throughput at the worst seed: **0.650 → 0.727 Gb/s, which is 6.5% → 7.3% of 10GbE.** Still nowhere near
+line rate. That needs a wider datapath, not a faster counter.
+
+The flip-flop floor check (≥ 962) still passes. The hand count from the RTL is now about 1,039
+(framer 54 + decoder 985), and Yosys reports 1,040.
+
+### Where the critical path is now
+
+The gain is real but moderate: median +8.9%, worst seed +11.8%. Here's why it isn't bigger:
+
+1. **The old path got much shorter, but it's still long because of wiring.** Seeds 1 and 2 still
+   end there: `msg_first` → `pos` → slot decode → an `mbuf` byte's write-enable
+   (`rtl/itch_decoder.v`, the `mbuf[pos] <= msg_data` line). It went from **18 logic steps
+   (10.9–12.3 ns) to 8 (10.3–10.4 ns)**, and the 12-cell carry chain is gone. But logic is now
+   only 2.85 ns of it; **7.5 ns is routing**, carrying one decision out to 40 byte-enables
+   spread over 320 flip-flops. A narrower counter can't shorten those wires.
+2. **A second path was just behind it, and now it's the worst one.** On seeds 3, 4, and 5
+   (including the worst, seed 4 at 11.00 ns), the path starts at `mbuf[0]` (the message's type
+   byte) → `spec_len(mtype)` → `supported = (len_q == want_len)` → the synchronous-reset input of
+   output registers like `out_mpid` and `out_new_order_ref`. That reset is how "this field is 0
+   unless this type has it" got implemented (the `SB_DFFESR` cells). It's 6–7 logic steps with
+   **6.6–8.0 ns routing**, because `supported` and the type decode fan out to about 640 output
+   flip-flops.
+
+Both remaining paths are about 10.3–11.0 ns, and 64–73% of that is wire. Each is dominated by **fan-out**
+(one signal driving hundreds of flip-flops), not by deep logic. As requested, no other fixes were
+tried. Candidates for later: register `supported` and the type decode one clock earlier (they're
+known as soon as byte 0 and the length arrive, long before the last byte), or duplicate
+high-fan-out signals so each copy drives fewer flip-flops.

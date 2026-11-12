@@ -3,7 +3,8 @@
 
 System tasks like $display, $fopen, $random only work in a simulator; real
 hardware cannot "print".  They belong in the testbench (tb/), never in rtl/.
-This script fails if any `$name` appears in rtl/ outside of comments.
+This script fails if any `$name` (other than the compile-time $clog2)
+appears in rtl/ outside of comments.
 Also rejects `initial` blocks and `#delay`s, which are not synthesizable
 on most FPGA/ASIC flows.
 """
@@ -11,8 +12,11 @@ import glob
 import re
 import sys
 
+# $clog2 is the one allowed `$` function: it's a constant the compiler works
+# out while reading the code (e.g. $clog2(41) = 6), so it never becomes
+# hardware. Every synthesis tool supports it (Verilog-2005).
 BAD = [
-    (re.compile(r"\$[a-zA-Z_]\w*"), "system task/function ($...)"),
+    (re.compile(r"\$(?!clog2\b)[a-zA-Z_]\w*"), "system task/function ($...)"),
     (re.compile(r"\binitial\b"), "initial block"),
     (re.compile(r"#\s*\d"), "#delay"),
 ]

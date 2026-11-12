@@ -86,17 +86,33 @@ module itch_decoder #(
     // ------------------------------------------------------------------
     // Step 1: capture bytes into the buffer.
     // ------------------------------------------------------------------
-    reg  [7:0]  mbuf [0:BUF_BYTES-1];  // ("buf" is a Verilog keyword, so "mbuf")
-    reg  [15:0] offset;                // where the NEXT byte of this message goes
-    reg         done;                  // 1 for one clock after a message's last byte
-    reg  [15:0] len_q;                 // saved length of the finished message
+    // Width of the write-position counter (offset / pos).
+    //
+    // It only has to count far enough to say "past the end of the buffer",
+    // i.e. up to BUF_BYTES itself. $clog2(N) = number of bits needed to
+    // count 0..N-1, so $clog2(BUF_BYTES + 1) bits can count 0..BUF_BYTES:
+    //     BUF_BYTES = 40  ->  $clog2(41) = 6 bits  ->  0..63
+    // Because the width is computed from BUF_BYTES, making the buffer bigger
+    // makes the counter wider automatically. It can't silently become too
+    // small. ($clog2 is worked out by the compiler, not built as hardware.)
+    //
+    // An earlier version used 16 bits. The `pos < BUF_BYTES` compare then
+    // became a 16-bit carry chain, which was the design's slowest path
+    // (see docs/DECISIONS.md, "Critical-path fix").
+    localparam OFF_W = $clog2(BUF_BYTES + 1);
+    localparam [OFF_W-1:0] OFF_MAX = {OFF_W{1'b1}};   // all ones: 63 for 6 bits
+
+    reg  [7:0]       mbuf [0:BUF_BYTES-1];  // ("buf" is a Verilog keyword, so "mbuf")
+    reg  [OFF_W-1:0] offset;                // where the NEXT byte of this message goes
+    reg              done;                  // 1 for one clock after a message's last byte
+    reg  [15:0]      len_q;                 // saved length of the finished message
 
     // Byte 0 of a message always goes to mbuf[0], whatever offset says.
-    wire [15:0] pos = msg_first ? 16'd0 : offset;
+    wire [OFF_W-1:0] pos = msg_first ? {OFF_W{1'b0}} : offset;
 
     always @(posedge clk) begin
         if (rst) begin
-            offset <= 16'd0;
+            offset <= {OFF_W{1'b0}};
             done   <= 1'b0;
             len_q  <= 16'd0;
         end else begin
@@ -104,7 +120,15 @@ module itch_decoder #(
             if (msg_valid) begin
                 if (pos < BUF_BYTES)
                     mbuf[pos] <= msg_data;
-                offset <= pos + 16'd1;
+                // SATURATE: count up to OFF_MAX (63) and stay there.
+                // A plain counter would wrap 63 -> 0 on a long message, and
+                // bytes 64, 128, 192, ... would overwrite mbuf[0] (the type
+                // byte). The 300-byte test message caught exactly that:
+                // it came out as type 0xFF instead of 'T'. Since
+                // OFF_MAX >= BUF_BYTES, a saturated pos is never a buffer
+                // slot, so nothing more is written until the next message
+                // (msg_first) starts again at 0.
+                offset <= (pos == OFF_MAX) ? OFF_MAX : pos + 1'b1;
                 if (msg_last) begin
                     done  <= 1'b1;
                     len_q <= msg_len;

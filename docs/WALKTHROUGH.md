@@ -253,8 +253,8 @@ fastest clock at which every signal still arrives in time:
 Fmax = 1 / (the longest flip-flop-to-flip-flop delay)
 ```
 
-For this design on the iCE40, nextpnr measured the longest delay at about 11-12 ns, so
-Fmax ≈ 1 / 12.3 ns ≈ **81-92 MHz**. The number moves a little from run to run because the tool
+For this design on the iCE40, nextpnr measures the longest delay at about 10.3-11.0 ns, so
+Fmax ≈ 1 / 11.0 ns ≈ **91-97 MHz**. The number moves a little from run to run because the tool
 places the circuit with a random seed, and a different placement means different wire lengths.
 
 ### The critical path
@@ -262,34 +262,61 @@ places the circuit with a random seed, and a different placement means different
 The **critical path** is that longest flip-flop-to-flip-flop route: the one signal that limits
 Fmax. Speeding up anything else does nothing; only shortening this path raises Fmax.
 
-Ours starts at the framer's `msg_first` register (or, on some placements, the decoder's `offset`
-register, the other input to the same choice) and ends at the write-enable of one byte of the
-decoder's message buffer `mbuf`. In plain English, on every clock the decoder must answer:
-"**which of the 40 buffer slots does this byte go into?**" (`rtl/itch_decoder.v`, lines 95-106):
+#### Before the fix: "which slot does this byte go into?"
+
+The first `make synth` run found the critical path inside the decoder's byte buffer
+(`rtl/itch_decoder.v`, Step 1). On every clock the decoder must answer: "**which of the 40 buffer
+slots does this byte go into?**"
 
 1. `pos = msg_first ? 0 : offset`: choose the slot number. That's one LUT.
-2. `pos < BUF_BYTES`: is the slot inside the buffer? `pos` is 16 bits wide, so this is a
+2. `pos < BUF_BYTES`: is the slot inside the buffer? `pos` was **16 bits** wide, so this was a
    16-bit comparison, which the FPGA builds as a chain of 12 carry cells, one after another.
-3. Turn the slot number into 40 separate "write this byte" signals, one per slot. That's
-   a few more LUTs.
-4. Run those signals out to 320 flip-flops spread across the chip. **This is the slow part:**
-   measured, about 4 ns of the path is logic and 6.7–8.1 ns is just wire.
+3. Turn the slot number into 40 separate "write this byte" signals, one per slot.
+4. Run those signals out to 320 flip-flops spread across the chip.
 
-So most of the time is spent not computing, but **getting one decision to 40 places that are far
-apart**. (Fixing it is a later step. Possible fixes: a 6-bit counter instead of 16 bits, so the
-comparison is shorter, or a "one-hot" pointer that already holds one bit per slot.)
+That was 18 logic steps and 10.9-12.3 ns: **81-92 MHz.**
+
+#### The fix: a 6-bit counter that saturates
+
+A 40-byte buffer doesn't need a counter that can reach 65,535. Six bits (0-63) are enough to
+say "past the end". The width is computed from the buffer size with `$clog2`, so it grows if
+the buffer does.
+
+But a 6-bit counter that **wraps** (63 + 1 = 0) breaks on long messages. The test stream has
+a 300-byte message, and its bytes 64, 128, 192, and 256 would wrap around into slot 0 and
+overwrite the message type. `make test` caught this: the message came out as type `ff` instead
+of `T`. So the counter **saturates** instead: it climbs to 63 and stays there. 63 isn't a slot,
+so nothing more is written until the next message starts back at 0.
+
+Result: the comparison is now a few LUTs instead of a 12-cell chain, and this path dropped from
+18 logic steps to 8. **Fmax went to 91-97 MHz** (worst seed 81.28 → 90.89 MHz, +12%).
+
+#### After the fix: two paths, both mostly wire
+
+The gain is real but moderate, because the remaining delay is mostly **wire**, not logic:
+
+- **The slot path again** (seeds 1, 2): 2.85 ns of logic, 7.5 ns of wire. Getting one decision
+  to 40 places that are far apart takes time, however simple the decision is.
+- **A new path** (seeds 3, 4, 5, including the slowest): read the message's type byte →
+  look up that type's length → check it against the real length (`supported`) → tell about
+  640 output flip-flops "clear this field, this message type doesn't have it". Again mostly wire,
+  because one signal has to reach hundreds of flip-flops. That's called **high fan-out**.
+
+When a path is mostly wire, making the logic smarter barely helps. You have to reduce how far
+or how many places a signal must go, for example by computing it a clock earlier or making
+copies. Those are possible later steps.
 
 ### Throughput
 
-The parser takes 1 byte per clock, so:
+The parser takes 1 byte per clock, so (using the slowest seed, to be safe):
 
 ```
 bytes per second = Fmax x 1 byte
-81 MHz x 1 byte = 81 MB/s = 0.65 Gb/s
+91 MHz x 1 byte = 91 MB/s = 0.73 Gb/s       (before the fix: 81 MHz = 0.65 Gb/s)
 ```
 
 10 Gb Ethernet delivers 10 Gb/s = 1,250 MB/s. At 1 byte per clock that would need a 1,250 MHz
 clock. That is far beyond what FPGA logic like this runs at (typically tens to a few hundred MHz),
-even on expensive chips. So this parser reaches about 6.5% of 10GbE line
-rate. Real 10GbE designs move **8 bytes per clock** (a 64-bit bus) at 156.25 MHz instead, and that
-is the direction a future version would have to go.
+even on expensive chips. So this parser reaches about 7.3% of 10GbE line rate (6.5% before the
+fix). A faster counter can't close that gap. Real 10GbE designs move **8 bytes per clock** (a
+64-bit bus) at 156.25 MHz instead, and that is the direction a future version would have to go.
